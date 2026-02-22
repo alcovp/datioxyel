@@ -1,8 +1,14 @@
 use image::{Rgb, RgbImage};
 
-use crate::domain::{LightKind, Material, MaterialClass, ObjectKind, Scene};
-use crate::math::Vec3;
+use crate::domain::{LightKind, Material, ObjectKind, Scene};
+use crate::render::capabilities::{GPU_MAX_LIGHTS, GPU_MAX_OBJECTS};
 use crate::render::{RenderSettings, View};
+
+const MAX_GPU_MATERIALS: usize = 32;
+
+const OBJECT_KIND_PLANE: f32 = 0.0;
+const OBJECT_KIND_MENGER: f32 = 1.0;
+const OBJECT_KIND_SPHERE: f32 = 2.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -10,36 +16,44 @@ struct GpuParams {
     width: u32,
     height: u32,
     max_depth: u32,
-    sponge_iterations: u32,
     samples_per_pixel: u32,
+    object_count: u32,
+    material_count: u32,
+    light_count: u32,
     _padding_u0: u32,
-    _padding_u1: u32,
-    _padding_u2: u32,
     camera_origin: [f32; 4],
     camera_target: [f32; 4],
     camera_up: [f32; 4],
-    sponge_center: [f32; 4],
-    sun_direction: [f32; 4],
-    sun_color_intensity: [f32; 4],
-    floor_base_color: [f32; 4],
-    menger_base_color: [f32; 4],
-    mirror_sphere_center: [f32; 4],
+    object_meta: [[f32; 4]; GPU_MAX_OBJECTS],
+    object_data0: [[f32; 4]; GPU_MAX_OBJECTS],
+    object_data1: [[f32; 4]; GPU_MAX_OBJECTS],
+    material_albedo_roughness: [[f32; 4]; MAX_GPU_MATERIALS],
+    material_emission_metallic: [[f32; 4]; MAX_GPU_MATERIALS],
+    material_optics: [[f32; 4]; MAX_GPU_MATERIALS],
+    material_absorption: [[f32; 4]; MAX_GPU_MATERIALS],
+    light_direction: [[f32; 4]; GPU_MAX_LIGHTS],
+    light_color_intensity: [[f32; 4]; GPU_MAX_LIGHTS],
     scene_scalars: [f32; 4],
+    render_tuning0: [f32; 4],
+    render_tuning1: [f32; 4],
+    render_tuning2: [f32; 4],
+    render_tuning3: [f32; 4],
 }
 
 #[derive(Clone, Copy, Debug)]
 struct CompiledGpuScene {
-    floor_y: f32,
-    sponge_center: Vec3,
-    sponge_scale: f32,
-    sponge_iterations: u32,
-    mirror_sphere_center: Vec3,
-    mirror_sphere_radius: f32,
-    floor_color: Vec3,
-    menger_color: Vec3,
-    sun_direction: Vec3,
-    sun_color: Vec3,
-    sun_intensity: f32,
+    object_count: u32,
+    material_count: u32,
+    light_count: u32,
+    object_meta: [[f32; 4]; GPU_MAX_OBJECTS],
+    object_data0: [[f32; 4]; GPU_MAX_OBJECTS],
+    object_data1: [[f32; 4]; GPU_MAX_OBJECTS],
+    material_albedo_roughness: [[f32; 4]; MAX_GPU_MATERIALS],
+    material_emission_metallic: [[f32; 4]; MAX_GPU_MATERIALS],
+    material_optics: [[f32; 4]; MAX_GPU_MATERIALS],
+    material_absorption: [[f32; 4]; MAX_GPU_MATERIALS],
+    light_direction: [[f32; 4]; GPU_MAX_LIGHTS],
+    light_color_intensity: [[f32; 4]; GPU_MAX_LIGHTS],
 }
 
 struct GpuFrameResources {
@@ -164,55 +178,47 @@ impl GpuRenderer {
             width: settings.width,
             height: settings.height,
             max_depth: settings.max_depth,
-            sponge_iterations: compiled_scene.sponge_iterations,
             samples_per_pixel: settings.samples_per_pixel,
+            object_count: compiled_scene.object_count,
+            material_count: compiled_scene.material_count,
+            light_count: compiled_scene.light_count,
             _padding_u0: 0,
-            _padding_u1: 0,
-            _padding_u2: 0,
             camera_origin: [view.origin.x, view.origin.y, view.origin.z, 0.0],
             camera_target: [view.target.x, view.target.y, view.target.z, 0.0],
             camera_up: [view.up.x, view.up.y, view.up.z, 0.0],
-            sponge_center: [
-                compiled_scene.sponge_center.x,
-                compiled_scene.sponge_center.y,
-                compiled_scene.sponge_center.z,
+            object_meta: compiled_scene.object_meta,
+            object_data0: compiled_scene.object_data0,
+            object_data1: compiled_scene.object_data1,
+            material_albedo_roughness: compiled_scene.material_albedo_roughness,
+            material_emission_metallic: compiled_scene.material_emission_metallic,
+            material_optics: compiled_scene.material_optics,
+            material_absorption: compiled_scene.material_absorption,
+            light_direction: compiled_scene.light_direction,
+            light_color_intensity: compiled_scene.light_color_intensity,
+            scene_scalars: [view.vertical_fov_deg, 0.0, 0.0, 0.0],
+            render_tuning0: [
+                settings.tuning.march_max_steps as f32,
+                settings.tuning.hit_epsilon_scale,
+                settings.tuning.step_scale,
+                settings.tuning.rr_start_bounce as f32,
+            ],
+            render_tuning1: [
+                settings.tuning.shadow_max_steps as f32,
+                settings.tuning.ao_samples as f32,
+                settings.tuning.sampling_mode as u32 as f32,
                 0.0,
             ],
-            sun_direction: [
-                compiled_scene.sun_direction.x,
-                compiled_scene.sun_direction.y,
-                compiled_scene.sun_direction.z,
-                0.0,
+            render_tuning2: [
+                settings.tuning.adaptive_min_samples_fraction,
+                settings.tuning.adaptive_variance_threshold,
+                settings.tuning.adaptive_check_interval as f32,
+                settings.tuning.firefly_clamp_scale,
             ],
-            sun_color_intensity: [
-                compiled_scene.sun_color.x,
-                compiled_scene.sun_color.y,
-                compiled_scene.sun_color.z,
-                compiled_scene.sun_intensity,
-            ],
-            floor_base_color: [
-                compiled_scene.floor_color.x,
-                compiled_scene.floor_color.y,
-                compiled_scene.floor_color.z,
-                0.0,
-            ],
-            menger_base_color: [
-                compiled_scene.menger_color.x,
-                compiled_scene.menger_color.y,
-                compiled_scene.menger_color.z,
-                0.0,
-            ],
-            mirror_sphere_center: [
-                compiled_scene.mirror_sphere_center.x,
-                compiled_scene.mirror_sphere_center.y,
-                compiled_scene.mirror_sphere_center.z,
-                0.0,
-            ],
-            scene_scalars: [
-                compiled_scene.floor_y,
-                compiled_scene.sponge_scale,
-                compiled_scene.mirror_sphere_radius,
-                view.vertical_fov_deg,
+            render_tuning3: [
+                settings.tuning.shadow_distance_scale,
+                settings.tuning.shadow_min_step_scale,
+                settings.tuning.ao_radius_scale,
+                settings.tuning.ao_horizon_bias,
             ],
         };
         self.queue
@@ -352,65 +358,111 @@ impl GpuRenderer {
 }
 
 fn compile_scene(scene: &Scene) -> Result<CompiledGpuScene, String> {
-    let mut floor_y: Option<f32> = None;
-    let mut floor_color: Option<Vec3> = None;
-    let mut sponge_center: Option<Vec3> = None;
-    let mut sponge_scale: Option<f32> = None;
-    let mut sponge_iterations: Option<u32> = None;
-    let mut menger_color: Option<Vec3> = None;
-    let mut mirror_sphere_center: Option<Vec3> = None;
-    let mut mirror_sphere_radius: Option<f32> = None;
+    if scene.objects.is_empty() {
+        return Err("scene must contain at least one object".into());
+    }
+    if scene.materials.is_empty() {
+        return Err("scene must contain at least one material".into());
+    }
+    if scene.objects.len() > GPU_MAX_OBJECTS {
+        return Err(format!(
+            "scene has {} objects but GPU backend supports at most {}",
+            scene.objects.len(),
+            GPU_MAX_OBJECTS
+        ));
+    }
+    if scene.materials.len() > MAX_GPU_MATERIALS {
+        return Err(format!(
+            "scene has {} materials but GPU backend supports at most {}",
+            scene.materials.len(),
+            MAX_GPU_MATERIALS
+        ));
+    }
+    if scene.lights.len() > GPU_MAX_LIGHTS {
+        return Err(format!(
+            "scene has {} lights but GPU backend supports at most {}",
+            scene.lights.len(),
+            GPU_MAX_LIGHTS
+        ));
+    }
 
-    for object in &scene.objects {
+    let mut object_meta = [[0.0; 4]; GPU_MAX_OBJECTS];
+    let mut object_data0 = [[0.0; 4]; GPU_MAX_OBJECTS];
+    let mut object_data1 = [[0.0; 4]; GPU_MAX_OBJECTS];
+
+    for (index, object) in scene.objects.iter().enumerate() {
+        let material_id = object.material_id.0;
+        let _ = material_by_id(scene, object.name, material_id)?;
+        object_meta[index][1] = material_id as f32;
+
         match object.kind {
             ObjectKind::InfinitePlane { y } => {
-                let material = material_with_class(
-                    scene,
-                    object.name,
-                    object.material_id.0,
-                    MaterialClass::Floor,
-                )?;
-                if floor_y.replace(y).is_some() {
-                    return Err("scene has multiple floor planes; only one is supported".into());
-                }
-                floor_color = Some(material.albedo);
+                object_meta[index][0] = OBJECT_KIND_PLANE;
+                object_data0[index] = [y, 0.0, 0.0, 0.0];
             }
             ObjectKind::Menger {
                 center,
                 scale,
                 iterations,
             } => {
-                let material = material_with_class(
-                    scene,
-                    object.name,
-                    object.material_id.0,
-                    MaterialClass::Opaque,
-                )?;
-                if sponge_center.replace(center).is_some() {
-                    return Err("scene has multiple Menger objects; only one is supported".into());
+                if scale <= 0.0 {
+                    return Err(format!(
+                        "object '{}' has non-positive Menger scale ({scale})",
+                        object.name
+                    ));
                 }
-                sponge_scale = Some(scale);
-                sponge_iterations = Some(iterations);
-                menger_color = Some(material.albedo);
+                if iterations == 0 {
+                    return Err(format!(
+                        "object '{}' has zero Menger iterations",
+                        object.name
+                    ));
+                }
+                object_meta[index][0] = OBJECT_KIND_MENGER;
+                object_data0[index] = [center.x, center.y, center.z, scale];
+                object_data1[index] = [iterations as f32, 0.0, 0.0, 0.0];
             }
             ObjectKind::Sphere { center, radius } => {
-                let _ = material_with_class(
-                    scene,
-                    object.name,
-                    object.material_id.0,
-                    MaterialClass::Mirror,
-                )?;
-                if mirror_sphere_center.replace(center).is_some() {
-                    return Err("scene has multiple spheres; only one is supported".into());
+                if radius <= 0.0 {
+                    return Err(format!(
+                        "object '{}' has non-positive sphere radius ({radius})",
+                        object.name
+                    ));
                 }
-                mirror_sphere_radius = Some(radius);
+                object_meta[index][0] = OBJECT_KIND_SPHERE;
+                object_data0[index] = [center.x, center.y, center.z, radius];
             }
         }
     }
 
-    let mut sun_direction: Option<Vec3> = None;
-    let mut sun_color: Option<Vec3> = None;
-    let mut sun_intensity: Option<f32> = None;
+    let mut material_albedo_roughness = [[0.0; 4]; MAX_GPU_MATERIALS];
+    let mut material_emission_metallic = [[0.0; 4]; MAX_GPU_MATERIALS];
+    let mut material_optics = [[0.0; 4]; MAX_GPU_MATERIALS];
+    let mut material_absorption = [[0.0; 4]; MAX_GPU_MATERIALS];
+    for (index, material) in scene.materials.iter().enumerate() {
+        material_albedo_roughness[index] = [
+            material.albedo.x,
+            material.albedo.y,
+            material.albedo.z,
+            material.roughness,
+        ];
+        material_emission_metallic[index] = [
+            material.emission.x,
+            material.emission.y,
+            material.emission.z,
+            material.metallic,
+        ];
+        material_optics[index] = [material.ior, material.transmission, 0.0, 0.0];
+        material_absorption[index] = [
+            material.absorption.x,
+            material.absorption.y,
+            material.absorption.z,
+            0.0,
+        ];
+    }
+
+    let mut light_direction = [[0.0; 4]; GPU_MAX_LIGHTS];
+    let mut light_color_intensity = [[0.0; 4]; GPU_MAX_LIGHTS];
+    let mut light_count: usize = 0;
     for light in &scene.lights {
         match light.kind {
             LightKind::Directional {
@@ -424,84 +476,51 @@ fn compile_scene(scene: &Scene) -> Result<CompiledGpuScene, String> {
                         light.name
                     ));
                 }
-                if sun_direction.replace(direction.normalize()).is_some() {
-                    return Err(
-                        "scene has multiple directional lights; only one is supported".into(),
-                    );
+                if direction.length() < 0.0001 {
+                    return Err(format!(
+                        "light '{}' has near-zero direction vector",
+                        light.name
+                    ));
                 }
-                sun_color = Some(color);
-                sun_intensity = Some(intensity);
+                if light_count >= GPU_MAX_LIGHTS {
+                    return Err(format!(
+                        "scene has more than {} supported lights",
+                        GPU_MAX_LIGHTS
+                    ));
+                }
+                let slot = light_count;
+                let normalized = direction.normalize();
+                light_direction[slot] = [normalized.x, normalized.y, normalized.z, 0.0];
+                light_color_intensity[slot] = [color.x, color.y, color.z, intensity];
+                light_count += 1;
             }
         }
     }
 
-    let floor_y = floor_y.ok_or_else(|| "scene must include one floor plane".to_string())?;
-    let floor_color =
-        floor_color.ok_or_else(|| "scene must include a floor material color".to_string())?;
-    let sponge_center =
-        sponge_center.ok_or_else(|| "scene must include one Menger object".to_string())?;
-    let sponge_scale = sponge_scale.ok_or_else(|| "scene must include Menger scale".to_string())?;
-    if sponge_scale <= 0.0 {
-        return Err(format!("Menger scale must be positive, got {sponge_scale}"));
-    }
-    let sponge_iterations =
-        sponge_iterations.ok_or_else(|| "scene must include Menger iterations".to_string())?;
-    if sponge_iterations == 0 {
-        return Err("Menger iterations must be greater than zero".into());
-    }
-    let menger_color =
-        menger_color.ok_or_else(|| "scene must include a Menger material color".to_string())?;
-    let mirror_sphere_center =
-        mirror_sphere_center.ok_or_else(|| "scene must include one sphere".to_string())?;
-    let mirror_sphere_radius =
-        mirror_sphere_radius.ok_or_else(|| "scene must include sphere radius".to_string())?;
-    if mirror_sphere_radius <= 0.0 {
-        return Err(format!(
-            "sphere radius must be positive, got {mirror_sphere_radius}"
-        ));
-    }
-    let sun_direction =
-        sun_direction.ok_or_else(|| "scene must include one directional light".to_string())?;
-    if sun_direction.length() < 0.0001 {
-        return Err("directional light direction must be non-zero".into());
-    }
-
-    let sun_color =
-        sun_color.ok_or_else(|| "scene must include directional light color".to_string())?;
-    let sun_intensity = sun_intensity
-        .ok_or_else(|| "scene must include directional light intensity".to_string())?;
-
     Ok(CompiledGpuScene {
-        floor_y,
-        sponge_center,
-        sponge_scale,
-        sponge_iterations,
-        mirror_sphere_center,
-        mirror_sphere_radius,
-        floor_color,
-        menger_color,
-        sun_direction,
-        sun_color,
-        sun_intensity,
+        object_count: scene.objects.len() as u32,
+        material_count: scene.materials.len() as u32,
+        light_count: light_count as u32,
+        object_meta,
+        object_data0,
+        object_data1,
+        material_albedo_roughness,
+        material_emission_metallic,
+        material_optics,
+        material_absorption,
+        light_direction,
+        light_color_intensity,
     })
 }
 
-fn material_with_class<'a>(
+fn material_by_id<'a>(
     scene: &'a Scene,
     object_name: &str,
     material_id: usize,
-    expected: MaterialClass,
 ) -> Result<&'a Material, String> {
-    let material = scene.materials.get(material_id).ok_or_else(|| {
+    scene.materials.get(material_id).ok_or_else(|| {
         format!("object '{object_name}' references missing material id {material_id}")
-    })?;
-    if material.class != expected {
-        return Err(format!(
-            "object '{}' expects {:?} material class but got {:?} ({})",
-            object_name, expected, material.class, material.name
-        ));
-    }
-    Ok(material)
+    })
 }
 
 const GPU_SHADER_WGSL: &str = include_str!("shaders/raytrace.wgsl");

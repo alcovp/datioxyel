@@ -5,9 +5,13 @@ out/*.png
 out/*.gif
 engine/target/
 .cargo-home/
+.cargo_home/
 .yarn/*
 !.yarn/patches
 !.yarn/plugins
 !.yarn/releases
 !.yarn/sdks
 !.yarn/versions
+out/*.log
+out/**/*.log
+out/baseline/

@@ -6,6 +6,7 @@
     "app"
   ],
   "scripts": {
-    "render": "yarn workspace cobaia-app render"
+    "render": "yarn workspace cobaia-app render",
+    "render:orbit": "yarn workspace cobaia-app render:orbit"
   }
 }

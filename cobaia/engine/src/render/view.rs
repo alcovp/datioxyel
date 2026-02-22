@@ -23,7 +23,7 @@ impl View {
                 frame.camera_target[2],
             ),
             up: Vec3::new(0.0, 1.0, 0.0),
-            vertical_fov_deg: 38.0,
+            vertical_fov_deg: frame.camera_fov_deg,
         }
     }
 }

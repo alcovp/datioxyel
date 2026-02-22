@@ -3,7 +3,8 @@
   "private": true,
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "render": "yarn build && node dist/render.js"
+    "render": "yarn build && node dist/render.js",
+    "render:orbit": "yarn build && node dist/render.js --scene menger_glass_dual_light --camera 2.9,1.62,3.2 --target 0,-0.18,0 --orbit-frames 100 --orbit-turns 1 --quality balanced --spp 6 --depth 6 --sampling-mode sobol --batch-workers 2 --gif-fps 60 --output out/orbit.gif"
   },
   "devDependencies": {
     "@types/node": "^22.13.4",

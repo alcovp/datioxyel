@@ -1,4 +1,4 @@
-use crate::domain::{LightKind, MaterialClass, ObjectKind, Scene};
+use crate::domain::{MaterialClass, Scene};
 
 use super::RendererCapabilities;
 
@@ -20,10 +20,11 @@ pub fn validate_scene_against_capabilities(
             capabilities.max_lights
         ));
     }
-    if !capabilities
-        .supported_scene_ids
-        .iter()
-        .any(|supported| scene.id.eq_ignore_ascii_case(supported))
+    if !capabilities.supported_scene_ids.is_empty()
+        && !capabilities
+            .supported_scene_ids
+            .iter()
+            .any(|supported| scene.id.eq_ignore_ascii_case(supported))
     {
         return Err(format!("scene '{}' is not in renderer whitelist", scene.id));
     }
@@ -47,6 +48,11 @@ pub fn validate_scene_against_capabilities(
             ));
         }
     }
+    for material in &scene.materials {
+        material
+            .validate_physical()
+            .map_err(|error| format!("material '{}' is invalid: {error}", material.name))?;
+    }
 
     let has_glass = material_usage
         .iter()
@@ -64,31 +70,6 @@ pub fn validate_scene_against_capabilities(
         return Err(
             "scene uses reflective materials but renderer does not support reflection".into(),
         );
-    }
-
-    let mut floor_count = 0usize;
-    let mut menger_count = 0usize;
-    let mut sphere_count = 0usize;
-    for object in &scene.objects {
-        match object.kind {
-            ObjectKind::InfinitePlane { .. } => floor_count += 1,
-            ObjectKind::Menger { .. } => menger_count += 1,
-            ObjectKind::Sphere { .. } => sphere_count += 1,
-        }
-    }
-    if floor_count != 1 || menger_count != 1 || sphere_count != 1 {
-        return Err(
-            "current GPU backend expects exactly 1 plane, 1 Menger object and 1 sphere".into(),
-        );
-    }
-
-    let directional_light_count = scene
-        .lights
-        .iter()
-        .filter(|light| matches!(light.kind, LightKind::Directional { .. }))
-        .count();
-    if directional_light_count != 1 {
-        return Err("current GPU backend expects exactly 1 directional light".into());
     }
 
     Ok(())

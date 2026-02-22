@@ -1,3 +1,6 @@
+pub const GPU_MAX_OBJECTS: usize = 32;
+pub const GPU_MAX_LIGHTS: usize = 8;
+
 #[derive(Clone, Copy, Debug)]
 pub struct RendererCapabilities {
     pub supports_reflection: bool,
@@ -10,9 +13,9 @@ pub struct RendererCapabilities {
 pub fn gpu_capabilities() -> RendererCapabilities {
     RendererCapabilities {
         supports_reflection: true,
-        supports_refraction: false,
-        max_objects: 3,
-        max_lights: 1,
-        supported_scene_ids: &["menger_glass_on_plane"],
+        supports_refraction: true,
+        max_objects: GPU_MAX_OBJECTS,
+        max_lights: GPU_MAX_LIGHTS,
+        supported_scene_ids: &[],
     }
 }
