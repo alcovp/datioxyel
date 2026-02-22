@@ -1,16 +1,18 @@
+use std::collections::HashMap;
 use std::io::{self, Read};
 use std::time::Instant;
 
 mod config;
-mod cpu;
+mod domain;
 mod gpu;
 mod math;
-mod scene;
+mod render;
 
-use config::{validate_config, DebugOptions, IncomingConfig, RenderMode};
-use cpu::render_cpu;
+use config::{validate_config, IncomingConfig};
+use domain::presets::build_scene;
 use gpu::GpuRenderer;
-use scene::Scene;
+use render::validation::validate_scene_against_capabilities;
+use render::{gpu_capabilities, RenderSettings, View};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut raw = String::new();
@@ -25,56 +27,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("frames array must not be empty".into());
     }
 
-    let scene = Scene::stage4_scene();
-    let debug_options = DebugOptions::from_env();
     let total = frames.len();
-    let mut gpu_renderer: Option<GpuRenderer> = None;
-    let mut gpu_init_error: Option<String> = None;
+    let mut prepared_frames = Vec::with_capacity(total);
 
-    for (index, frame) in frames.iter().enumerate() {
+    for frame in &frames {
         validate_config(frame)?;
-        let mode = RenderMode::parse(&frame.renderer_mode);
-        let started = Instant::now();
-        let image = match mode {
-            RenderMode::Cpu => render_cpu(frame, scene, debug_options),
-            RenderMode::Gpu => {
-                if gpu_renderer.is_none() && gpu_init_error.is_none() {
-                    match pollster::block_on(GpuRenderer::new(debug_options)) {
-                        Ok(renderer) => {
-                            gpu_renderer = Some(renderer);
-                        }
-                        Err(error) => {
-                            gpu_init_error = Some(error);
-                        }
-                    }
-                }
+        prepared_frames.push((
+            RenderSettings::from_frame(frame),
+            View::from_frame(frame),
+            frame.scene.clone(),
+        ));
+    }
 
-                if let Some(renderer) = gpu_renderer.as_mut() {
-                    match renderer.render_frame(frame, scene) {
-                        Ok(image) => image,
-                        Err(error) => {
-                            eprintln!("GPU render failed: {error}. Falling back to CPU.");
-                            render_cpu(frame, scene, debug_options)
-                        }
-                    }
-                } else {
-                    if let Some(error) = &gpu_init_error {
-                        eprintln!("GPU initialization failed: {error}. Falling back to CPU.");
-                    }
-                    render_cpu(frame, scene, debug_options)
-                }
-            }
-        };
+    let capabilities = gpu_capabilities();
+    let mut scene_cache = HashMap::new();
+    let mut gpu_renderer = pollster::block_on(GpuRenderer::new())
+        .map_err(|error| format!("GPU initialization failed: {error}"))?;
+
+    for (index, (settings, view, scene_id)) in prepared_frames.iter().enumerate() {
+        let cache_key = scene_id.to_ascii_lowercase();
+        if !scene_cache.contains_key(&cache_key) {
+            let scene = build_scene(scene_id)
+                .map_err(|error| format!("Failed to build scene '{}': {error}", scene_id))?;
+            validate_scene_against_capabilities(&scene, capabilities).map_err(|error| {
+                format!(
+                    "Scene '{}' is not supported by current renderer: {error}",
+                    scene.id
+                )
+            })?;
+            scene_cache.insert(cache_key.clone(), scene);
+        }
+        let scene = scene_cache
+            .get(&cache_key)
+            .ok_or_else(|| format!("internal error: scene cache miss for '{scene_id}'"))?;
+
+        let started = Instant::now();
+        let image = gpu_renderer
+            .render_frame(settings, view, scene)
+            .map_err(|error| format!("GPU render failed: {error}"))?;
         let elapsed_ms = started.elapsed().as_millis();
-        image.save(&frame.output_path)?;
+        image.save(&settings.output_path)?;
 
         println!(
-            "[{}/{}] Rendered stage 4 frame [{}] in {} ms: {}",
+            "[{}/{}] Rendered scene '{}' [GPU] in {} ms: {}",
             index + 1,
             total,
-            mode.as_str(),
+            scene.id,
             elapsed_ms,
-            frame.output_path
+            settings.output_path
         );
     }
 

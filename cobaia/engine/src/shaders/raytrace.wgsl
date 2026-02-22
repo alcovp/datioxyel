@@ -3,14 +3,20 @@ struct Params {
     height: u32,
     max_depth: u32,
     sponge_iterations: u32,
+    samples_per_pixel: u32,
+    _padding_u0: u32,
+    _padding_u1: u32,
+    _padding_u2: u32,
     camera_origin: vec4<f32>,
     camera_target: vec4<f32>,
+    camera_up: vec4<f32>,
+    sponge_center: vec4<f32>,
     sun_direction: vec4<f32>,
+    sun_color_intensity: vec4<f32>,
+    floor_base_color: vec4<f32>,
+    menger_base_color: vec4<f32>,
     mirror_sphere_center: vec4<f32>,
-    floor_y: f32,
-    sponge_scale: f32,
-    mirror_sphere_radius: f32,
-    samples_per_pixel: u32,
+    scene_scalars: vec4<f32>,
 };
 
 @group(0) @binding(0) var output_tex: texture_storage_2d<rgba8unorm, write>;
@@ -65,13 +71,15 @@ fn sd_menger(p: vec3<f32>) -> f32 {
 }
 
 fn sample_scene(p: vec3<f32>) -> vec2<f32> {
-    let floor_distance = p.y - params.floor_y;
-    let sponge_center = vec3<f32>(0.0, params.floor_y + params.sponge_scale, 0.0);
-    let local = (p - sponge_center) / params.sponge_scale;
-    let sponge_distance = sd_menger(local) * params.sponge_scale;
+    let floor_y = params.scene_scalars.x;
+    let sponge_scale = params.scene_scalars.y;
+    let mirror_sphere_radius = params.scene_scalars.z;
+    let floor_distance = p.y - floor_y;
+    let local = (p - params.sponge_center.xyz) / sponge_scale;
+    let sponge_distance = sd_menger(local) * sponge_scale;
     let mirror_sphere_distance = sd_sphere(
         p - params.mirror_sphere_center.xyz,
-        params.mirror_sphere_radius
+        mirror_sphere_radius
     );
 
     var best = vec2<f32>(floor_distance, 0.0);
@@ -164,6 +172,10 @@ fn ambient_occlusion(origin: vec3<f32>, normal: vec3<f32>) -> f32 {
     return clamp(1.0 - (occlusion * 1.7), 0.0, 1.0);
 }
 
+fn sun_radiance() -> vec3<f32> {
+    return params.sun_color_intensity.xyz * params.sun_color_intensity.w;
+}
+
 fn background_color(direction: vec3<f32>) -> vec3<f32> {
     let unit = normalize(direction);
     let t = 0.5 * (unit.y + 1.0);
@@ -172,7 +184,7 @@ fn background_color(direction: vec3<f32>) -> vec3<f32> {
     let base = (bottom * (1.0 - t)) + (top * t);
 
     let sun_alignment = max(dot(unit, -params.sun_direction.xyz), 0.0);
-    let sun = vec3<f32>(1.0, 0.96, 0.9) * pow(sun_alignment, 420.0) * 6.0;
+    let sun = sun_radiance() * pow(sun_alignment, 420.0) * 6.0;
     return clamp(base + sun, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
@@ -188,14 +200,15 @@ fn shade_floor(hit: Hit) -> vec3<f32> {
     );
     let ambient = 0.08;
     let direct = lambert * shadow;
-    let shade = ambient + (0.92 * direct);
+    let sunlight = sun_radiance();
 
-    let base = vec3<f32>(0.94, 0.94, 0.93);
+    let base = params.floor_base_color.xyz;
     let hemi = 0.5 * (hit.normal.y + 1.0);
     let bounce = vec3<f32>(0.08, 0.1, 0.12) * (0.03 * hemi);
     let distance_fade = clamp(1.0 - (hit.t * 0.012), 0.7, 1.0);
+    let lit = ((base * ambient) + ((base * (0.92 * direct)) * sunlight)) * distance_fade;
 
-    return clamp((base * shade * distance_fade) + bounce, vec3<f32>(0.0), vec3<f32>(1.0));
+    return clamp(lit + bounce, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 fn shade_opaque_red(hit: Hit, ray_dir: vec3<f32>) -> vec3<f32> {
@@ -216,12 +229,13 @@ fn shade_opaque_red(hit: Hit, ray_dir: vec3<f32>) -> vec3<f32> {
     let view = normalize(-ray_dir);
     let half_vec = normalize(light_dir + view);
     let spec = pow(max(dot(hit.normal, half_vec), 0.0), 64.0) * shadow;
+    let sunlight = sun_radiance();
 
-    let base = vec3<f32>(0.9, 0.09, 0.08);
-    let lit = base * (ambient + (0.92 * diffuse));
+    let base = params.menger_base_color.xyz;
+    let lit = (base * ambient) + ((base * (0.92 * diffuse)) * sunlight);
     let sky_tint = vec3<f32>(0.24, 0.32, 0.44) * (0.12 * hemi);
     let bounce_tint = vec3<f32>(0.18, 0.04, 0.03) * (0.08 * (1.0 - hemi));
-    let highlight = vec3<f32>(spec * 0.2);
+    let highlight = sunlight * (spec * 0.2);
     let distance_fade = clamp(1.0 - (hit.t * 0.014), 0.72, 1.0);
 
     return clamp((((lit + sky_tint + bounce_tint) * ao) + highlight) * distance_fade, vec3<f32>(0.0), vec3<f32>(1.0));
@@ -238,7 +252,7 @@ fn shade_sphere_lighting(hit: Hit, ray_dir: vec3<f32>) -> vec3<f32> {
         24.0,
         36.0
     );
-    let highlight = vec3<f32>(sun_spec * sun_shadow * 0.06);
+    let highlight = sun_radiance() * (sun_spec * sun_shadow * 0.06);
     return highlight;
 }
 
@@ -374,13 +388,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let height_f = max(f32(params.height), 1.0);
     let aspect_ratio = width_f / height_f;
 
-    let theta = radians(38.0);
+    let theta = radians(max(params.scene_scalars.w, 1.0));
     let h = tan(theta * 0.5);
     let viewport_height = 2.0 * h;
     let viewport_width = aspect_ratio * viewport_height;
 
     let w = normalize(origin - camera_target);
-    var up = vec3<f32>(0.0, 1.0, 0.0);
+    var up = params.camera_up.xyz;
+    if (length(up) < 0.0001) {
+        up = vec3<f32>(0.0, 1.0, 0.0);
+    } else {
+        up = normalize(up);
+    }
     if (abs(dot(up, w)) > 0.999) {
         up = vec3<f32>(0.0, 0.0, 1.0);
     }

@@ -1,7 +1,8 @@
 use image::{Rgb, RgbImage};
 
-use crate::config::{DebugOptions, RenderFrameConfig};
-use crate::scene::Scene;
+use crate::domain::{LightKind, Material, MaterialClass, ObjectKind, Scene};
+use crate::math::Vec3;
+use crate::render::{RenderSettings, View};
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -10,14 +11,35 @@ struct GpuParams {
     height: u32,
     max_depth: u32,
     sponge_iterations: u32,
+    samples_per_pixel: u32,
+    _padding_u0: u32,
+    _padding_u1: u32,
+    _padding_u2: u32,
     camera_origin: [f32; 4],
     camera_target: [f32; 4],
+    camera_up: [f32; 4],
+    sponge_center: [f32; 4],
     sun_direction: [f32; 4],
+    sun_color_intensity: [f32; 4],
+    floor_base_color: [f32; 4],
+    menger_base_color: [f32; 4],
     mirror_sphere_center: [f32; 4],
+    scene_scalars: [f32; 4],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CompiledGpuScene {
     floor_y: f32,
+    sponge_center: Vec3,
     sponge_scale: f32,
+    sponge_iterations: u32,
+    mirror_sphere_center: Vec3,
     mirror_sphere_radius: f32,
-    samples_per_pixel: u32,
+    floor_color: Vec3,
+    menger_color: Vec3,
+    sun_direction: Vec3,
+    sun_color: Vec3,
+    sun_intensity: f32,
 }
 
 struct GpuFrameResources {
@@ -40,14 +62,7 @@ pub struct GpuRenderer {
 }
 
 impl GpuRenderer {
-    pub async fn new(debug: DebugOptions) -> Result<Self, String> {
-        if !debug.force_opaque_red_menger {
-            return Err(
-                "GPU mode currently supports the opaque-red shading path; set COBAIA_FORCE_OPAQUE_RED_MENGER=true"
-                    .to_string(),
-            );
-        }
-
+    pub async fn new() -> Result<Self, String> {
         let instance = wgpu::Instance::default();
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -133,48 +148,72 @@ impl GpuRenderer {
 
     pub fn render_frame(
         &mut self,
-        config: &RenderFrameConfig,
-        scene: Scene,
+        settings: &RenderSettings,
+        view: &View,
+        scene: &Scene,
     ) -> Result<RgbImage, String> {
-        self.ensure_frame_resources(config.width, config.height);
+        let compiled_scene = compile_scene(scene)?;
+
+        self.ensure_frame_resources(settings.width, settings.height);
         let frame = self
             .frame_resources
             .as_ref()
             .ok_or_else(|| "GPU frame resources are not initialized".to_string())?;
 
         let gpu_params = GpuParams {
-            width: config.width,
-            height: config.height,
-            max_depth: config.max_depth as u32,
-            sponge_iterations: scene.sponge_iterations,
-            camera_origin: [
-                config.camera_origin[0],
-                config.camera_origin[1],
-                config.camera_origin[2],
-                0.0,
-            ],
-            camera_target: [
-                config.camera_target[0],
-                config.camera_target[1],
-                config.camera_target[2],
+            width: settings.width,
+            height: settings.height,
+            max_depth: settings.max_depth,
+            sponge_iterations: compiled_scene.sponge_iterations,
+            samples_per_pixel: settings.samples_per_pixel,
+            _padding_u0: 0,
+            _padding_u1: 0,
+            _padding_u2: 0,
+            camera_origin: [view.origin.x, view.origin.y, view.origin.z, 0.0],
+            camera_target: [view.target.x, view.target.y, view.target.z, 0.0],
+            camera_up: [view.up.x, view.up.y, view.up.z, 0.0],
+            sponge_center: [
+                compiled_scene.sponge_center.x,
+                compiled_scene.sponge_center.y,
+                compiled_scene.sponge_center.z,
                 0.0,
             ],
             sun_direction: [
-                scene.sun_direction.x,
-                scene.sun_direction.y,
-                scene.sun_direction.z,
+                compiled_scene.sun_direction.x,
+                compiled_scene.sun_direction.y,
+                compiled_scene.sun_direction.z,
+                0.0,
+            ],
+            sun_color_intensity: [
+                compiled_scene.sun_color.x,
+                compiled_scene.sun_color.y,
+                compiled_scene.sun_color.z,
+                compiled_scene.sun_intensity,
+            ],
+            floor_base_color: [
+                compiled_scene.floor_color.x,
+                compiled_scene.floor_color.y,
+                compiled_scene.floor_color.z,
+                0.0,
+            ],
+            menger_base_color: [
+                compiled_scene.menger_color.x,
+                compiled_scene.menger_color.y,
+                compiled_scene.menger_color.z,
                 0.0,
             ],
             mirror_sphere_center: [
-                scene.mirror_sphere_center.x,
-                scene.mirror_sphere_center.y,
-                scene.mirror_sphere_center.z,
+                compiled_scene.mirror_sphere_center.x,
+                compiled_scene.mirror_sphere_center.y,
+                compiled_scene.mirror_sphere_center.z,
                 0.0,
             ],
-            floor_y: scene.floor_y,
-            sponge_scale: scene.sponge_scale,
-            mirror_sphere_radius: scene.mirror_sphere_radius,
-            samples_per_pixel: config.samples_per_pixel.max(1) as u32,
+            scene_scalars: [
+                compiled_scene.floor_y,
+                compiled_scene.sponge_scale,
+                compiled_scene.mirror_sphere_radius,
+                view.vertical_fov_deg,
+            ],
         };
         self.queue
             .write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&gpu_params));
@@ -191,8 +230,8 @@ impl GpuRenderer {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &frame.bind_group, &[]);
-            let groups_x = (config.width + 7) / 8;
-            let groups_y = (config.height + 7) / 8;
+            let groups_x = (settings.width + 7) / 8;
+            let groups_y = (settings.height + 7) / 8;
             pass.dispatch_workgroups(groups_x, groups_y, 1);
         }
 
@@ -208,12 +247,12 @@ impl GpuRenderer {
                 layout: wgpu::ImageDataLayout {
                     offset: 0,
                     bytes_per_row: Some(frame.padded_bytes_per_row),
-                    rows_per_image: Some(config.height),
+                    rows_per_image: Some(settings.height),
                 },
             },
             wgpu::Extent3d {
-                width: config.width,
-                height: config.height,
+                width: settings.width,
+                height: settings.height,
                 depth_or_array_layers: 1,
             },
         );
@@ -233,10 +272,10 @@ impl GpuRenderer {
 
         let bytes_per_pixel = 4usize;
         let data = slice.get_mapped_range();
-        let mut image = RgbImage::new(config.width, config.height);
-        for y in 0..config.height as usize {
+        let mut image = RgbImage::new(settings.width, settings.height);
+        for y in 0..settings.height as usize {
             let row_start = y * frame.padded_bytes_per_row as usize;
-            for x in 0..config.width as usize {
+            for x in 0..settings.width as usize {
                 let pixel_start = row_start + (x * bytes_per_pixel);
                 let r = data[pixel_start];
                 let g = data[pixel_start + 1];
@@ -310,6 +349,159 @@ impl GpuRenderer {
             bind_group,
         });
     }
+}
+
+fn compile_scene(scene: &Scene) -> Result<CompiledGpuScene, String> {
+    let mut floor_y: Option<f32> = None;
+    let mut floor_color: Option<Vec3> = None;
+    let mut sponge_center: Option<Vec3> = None;
+    let mut sponge_scale: Option<f32> = None;
+    let mut sponge_iterations: Option<u32> = None;
+    let mut menger_color: Option<Vec3> = None;
+    let mut mirror_sphere_center: Option<Vec3> = None;
+    let mut mirror_sphere_radius: Option<f32> = None;
+
+    for object in &scene.objects {
+        match object.kind {
+            ObjectKind::InfinitePlane { y } => {
+                let material = material_with_class(
+                    scene,
+                    object.name,
+                    object.material_id.0,
+                    MaterialClass::Floor,
+                )?;
+                if floor_y.replace(y).is_some() {
+                    return Err("scene has multiple floor planes; only one is supported".into());
+                }
+                floor_color = Some(material.albedo);
+            }
+            ObjectKind::Menger {
+                center,
+                scale,
+                iterations,
+            } => {
+                let material = material_with_class(
+                    scene,
+                    object.name,
+                    object.material_id.0,
+                    MaterialClass::Opaque,
+                )?;
+                if sponge_center.replace(center).is_some() {
+                    return Err("scene has multiple Menger objects; only one is supported".into());
+                }
+                sponge_scale = Some(scale);
+                sponge_iterations = Some(iterations);
+                menger_color = Some(material.albedo);
+            }
+            ObjectKind::Sphere { center, radius } => {
+                let _ = material_with_class(
+                    scene,
+                    object.name,
+                    object.material_id.0,
+                    MaterialClass::Mirror,
+                )?;
+                if mirror_sphere_center.replace(center).is_some() {
+                    return Err("scene has multiple spheres; only one is supported".into());
+                }
+                mirror_sphere_radius = Some(radius);
+            }
+        }
+    }
+
+    let mut sun_direction: Option<Vec3> = None;
+    let mut sun_color: Option<Vec3> = None;
+    let mut sun_intensity: Option<f32> = None;
+    for light in &scene.lights {
+        match light.kind {
+            LightKind::Directional {
+                direction,
+                color,
+                intensity,
+            } => {
+                if intensity <= 0.0 {
+                    return Err(format!(
+                        "light '{}' has non-positive intensity ({intensity})",
+                        light.name
+                    ));
+                }
+                if sun_direction.replace(direction.normalize()).is_some() {
+                    return Err(
+                        "scene has multiple directional lights; only one is supported".into(),
+                    );
+                }
+                sun_color = Some(color);
+                sun_intensity = Some(intensity);
+            }
+        }
+    }
+
+    let floor_y = floor_y.ok_or_else(|| "scene must include one floor plane".to_string())?;
+    let floor_color =
+        floor_color.ok_or_else(|| "scene must include a floor material color".to_string())?;
+    let sponge_center =
+        sponge_center.ok_or_else(|| "scene must include one Menger object".to_string())?;
+    let sponge_scale = sponge_scale.ok_or_else(|| "scene must include Menger scale".to_string())?;
+    if sponge_scale <= 0.0 {
+        return Err(format!("Menger scale must be positive, got {sponge_scale}"));
+    }
+    let sponge_iterations =
+        sponge_iterations.ok_or_else(|| "scene must include Menger iterations".to_string())?;
+    if sponge_iterations == 0 {
+        return Err("Menger iterations must be greater than zero".into());
+    }
+    let menger_color =
+        menger_color.ok_or_else(|| "scene must include a Menger material color".to_string())?;
+    let mirror_sphere_center =
+        mirror_sphere_center.ok_or_else(|| "scene must include one sphere".to_string())?;
+    let mirror_sphere_radius =
+        mirror_sphere_radius.ok_or_else(|| "scene must include sphere radius".to_string())?;
+    if mirror_sphere_radius <= 0.0 {
+        return Err(format!(
+            "sphere radius must be positive, got {mirror_sphere_radius}"
+        ));
+    }
+    let sun_direction =
+        sun_direction.ok_or_else(|| "scene must include one directional light".to_string())?;
+    if sun_direction.length() < 0.0001 {
+        return Err("directional light direction must be non-zero".into());
+    }
+
+    let sun_color =
+        sun_color.ok_or_else(|| "scene must include directional light color".to_string())?;
+    let sun_intensity = sun_intensity
+        .ok_or_else(|| "scene must include directional light intensity".to_string())?;
+
+    Ok(CompiledGpuScene {
+        floor_y,
+        sponge_center,
+        sponge_scale,
+        sponge_iterations,
+        mirror_sphere_center,
+        mirror_sphere_radius,
+        floor_color,
+        menger_color,
+        sun_direction,
+        sun_color,
+        sun_intensity,
+    })
+}
+
+fn material_with_class<'a>(
+    scene: &'a Scene,
+    object_name: &str,
+    material_id: usize,
+    expected: MaterialClass,
+) -> Result<&'a Material, String> {
+    let material = scene.materials.get(material_id).ok_or_else(|| {
+        format!("object '{object_name}' references missing material id {material_id}")
+    })?;
+    if material.class != expected {
+        return Err(format!(
+            "object '{}' expects {:?} material class but got {:?} ({})",
+            object_name, expected, material.class, material.name
+        ));
+    }
+    Ok(material)
 }
 
 const GPU_SHADER_WGSL: &str = include_str!("shaders/raytrace.wgsl");

@@ -12,7 +12,7 @@ type RenderFrameConfig = {
   maxDepth: number;
   samplesPerPixel: number;
   scene: string;
-  rendererMode: "cpu" | "gpu";
+  rendererMode: "gpu";
   cameraOrigin: Vec3;
   cameraTarget: Vec3;
 };
@@ -35,14 +35,13 @@ async function main(): Promise<void> {
   const frameCount = 100;
   const frameExportStride = 10;
   const gifFps = parsePositiveInt(process.env.GIF_FPS, 60);
-  const rendererMode: "cpu" | "gpu" =
-    process.env.RENDERER_MODE?.toLowerCase() === "cpu" ? "cpu" : "gpu";
+  const rendererMode: "gpu" = "gpu";
   const orbitTarget: Vec3 = [0.0, -0.18, 0.0];
   const orbitHeight = 1.62;
   const orbitRadius = Math.hypot(2.9, 3.2);
   const orbitStartAngle = Math.atan2(3.2, 2.9);
 
-  console.log(`Renderer mode: ${rendererMode.toUpperCase()}`);
+  console.log("Renderer mode: GPU");
 
   const frames: RenderFrameConfig[] = [];
   for (let frame = 0; frame < frameCount; frame += 1) {
