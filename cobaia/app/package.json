@@ -1,0 +1,12 @@
+{
+  "name": "cobaia-app",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "render": "yarn build && node dist/render.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.4",
+    "typescript": "^5.8.2"
+  }
+}
