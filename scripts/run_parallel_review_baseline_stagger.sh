@@ -179,6 +179,11 @@ EOF
   WORKER_STATUS+=("running")
   WORKER_STARTED_AT+=("${started_at}")
   WORKER_ENDED_AT+=("0")
+
+  if (( i < COUNT )); then
+    stagger_ms=$((1000 + RANDOM % 9001))
+    sleep "$(printf "%d.%03d" $((stagger_ms / 1000)) $((stagger_ms % 1000)))"
+  fi
 done
 
 success_count=0
