@@ -7,6 +7,12 @@
   ],
   "scripts": {
     "render": "yarn workspace cobaia-app render",
-    "render:orbit": "yarn workspace cobaia-app render:orbit"
+    "render:orbit": "yarn workspace cobaia-app render:orbit",
+    "render:nested-media": "yarn workspace cobaia-app render -- --scene nested_media_aquarium --camera 3.35,1.28,2.75 --target 0,0.08,0 --fov 36 --quality final --spp 8 --depth 8 --sampling-mode sobol --output out/nested_media_aquarium.png",
+    "render:nested-media:orbit": "yarn workspace cobaia-app render -- --scene nested_media_aquarium --camera 3.35,1.28,2.75 --target 0,0.08,0 --fov 36 --orbit-frames 96 --orbit-turns 1 --quality balanced --spp 4 --depth 7 --sampling-mode sobol --batch-workers 4 --gif-fps 60 --output out/nested_media_aquarium_orbit.gif",
+    "render:primitives-gallery": "yarn workspace cobaia-app render -- --scene primitives_gallery --camera 4.2,1.55,3.6 --target 0.4,-0.45,0.45 --fov 34 --quality balanced --spp 4 --depth 7 --sampling-mode sobol --output out/primitives_gallery.png",
+    "render:primitives-gallery:orbit": "yarn workspace cobaia-app render -- --scene primitives_gallery --camera 4.2,1.55,3.6 --target 0.4,-0.45,0.45 --fov 34 --orbit-frames 96 --orbit-turns 1 --quality balanced --spp 4 --depth 7 --sampling-mode sobol --batch-workers 4 --gif-fps 60 --output out/primitives_gallery_orbit.gif",
+    "render:rounded-box-glass-only": "yarn workspace cobaia-app render -- --scene rounded_box_glass_only --camera 4.2,1.55,3.6 --target 0.4,-0.45,0.45 --fov 34 --quality balanced --spp 4 --depth 7 --sampling-mode sobol --output out/rounded_box_glass_only.png",
+    "render:rounded-box-glass-only:orbit": "yarn workspace cobaia-app render -- --scene rounded_box_glass_only --camera 4.2,1.55,3.6 --target 0.4,-0.45,0.45 --fov 34 --orbit-frames 96 --orbit-turns 1 --quality balanced --spp 4 --depth 7 --sampling-mode sobol --batch-workers 4 --gif-fps 60 --output out/rounded_box_glass_only_orbit.gif"
   }
 }

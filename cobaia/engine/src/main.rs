@@ -78,5 +78,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // In this CLI workflow the renderer lifetime matches the process lifetime.
+    // Some GPU/driver stacks can crash while tearing down WGPU objects on drop.
+    std::mem::forget(gpu_renderer);
+
     Ok(())
 }

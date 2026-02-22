@@ -1,14 +1,14 @@
 use image::{Rgb, RgbImage};
 
-use crate::domain::{LightKind, Material, ObjectKind, Scene};
-use crate::render::capabilities::{GPU_MAX_LIGHTS, GPU_MAX_OBJECTS};
+use crate::domain::Scene;
+use crate::render::capabilities::{GPU_MAX_LIGHTS, GPU_MAX_MATERIALS, GPU_MAX_OBJECTS};
 use crate::render::{RenderSettings, View};
 
-const MAX_GPU_MATERIALS: usize = 32;
+mod scene_compile;
+mod shader_source;
 
-const OBJECT_KIND_PLANE: f32 = 0.0;
-const OBJECT_KIND_MENGER: f32 = 1.0;
-const OBJECT_KIND_SPHERE: f32 = 2.0;
+use scene_compile::compile_scene;
+use shader_source::build_gpu_shader_wgsl;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -27,10 +27,10 @@ struct GpuParams {
     object_meta: [[f32; 4]; GPU_MAX_OBJECTS],
     object_data0: [[f32; 4]; GPU_MAX_OBJECTS],
     object_data1: [[f32; 4]; GPU_MAX_OBJECTS],
-    material_albedo_roughness: [[f32; 4]; MAX_GPU_MATERIALS],
-    material_emission_metallic: [[f32; 4]; MAX_GPU_MATERIALS],
-    material_optics: [[f32; 4]; MAX_GPU_MATERIALS],
-    material_absorption: [[f32; 4]; MAX_GPU_MATERIALS],
+    material_albedo_roughness: [[f32; 4]; GPU_MAX_MATERIALS],
+    material_emission_metallic: [[f32; 4]; GPU_MAX_MATERIALS],
+    material_optics: [[f32; 4]; GPU_MAX_MATERIALS],
+    material_absorption: [[f32; 4]; GPU_MAX_MATERIALS],
     light_direction: [[f32; 4]; GPU_MAX_LIGHTS],
     light_color_intensity: [[f32; 4]; GPU_MAX_LIGHTS],
     scene_scalars: [f32; 4],
@@ -40,39 +40,24 @@ struct GpuParams {
     render_tuning3: [f32; 4],
 }
 
-#[derive(Clone, Copy, Debug)]
-struct CompiledGpuScene {
-    object_count: u32,
-    material_count: u32,
-    light_count: u32,
-    object_meta: [[f32; 4]; GPU_MAX_OBJECTS],
-    object_data0: [[f32; 4]; GPU_MAX_OBJECTS],
-    object_data1: [[f32; 4]; GPU_MAX_OBJECTS],
-    material_albedo_roughness: [[f32; 4]; MAX_GPU_MATERIALS],
-    material_emission_metallic: [[f32; 4]; MAX_GPU_MATERIALS],
-    material_optics: [[f32; 4]; MAX_GPU_MATERIALS],
-    material_absorption: [[f32; 4]; MAX_GPU_MATERIALS],
-    light_direction: [[f32; 4]; GPU_MAX_LIGHTS],
-    light_color_intensity: [[f32; 4]; GPU_MAX_LIGHTS],
-}
-
 struct GpuFrameResources {
+    bind_group: wgpu::BindGroup,
+    output_buffer: wgpu::Buffer,
+    output_texture: wgpu::Texture,
+    _output_view: wgpu::TextureView,
     width: u32,
     height: u32,
     padded_bytes_per_row: u32,
-    output_texture: wgpu::Texture,
-    _output_view: wgpu::TextureView,
-    output_buffer: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
 }
 
 pub struct GpuRenderer {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    // Keep dependent GPU resources before queue/device so they drop first.
+    frame_resources: Option<GpuFrameResources>,
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     params_buffer: wgpu::Buffer,
-    frame_resources: Option<GpuFrameResources>,
+    queue: wgpu::Queue,
+    device: wgpu::Device,
 }
 
 impl GpuRenderer {
@@ -99,9 +84,10 @@ impl GpuRenderer {
             .await
             .map_err(|error| format!("request_device failed: {error}"))?;
 
+        let shader_source = build_gpu_shader_wgsl();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cobaia-compute-shader"),
-            source: wgpu::ShaderSource::Wgsl(GPU_SHADER_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -151,12 +137,12 @@ impl GpuRenderer {
         });
 
         Ok(Self {
-            device,
-            queue,
+            frame_resources: None,
             pipeline,
             bind_group_layout,
             params_buffer,
-            frame_resources: None,
+            queue,
+            device,
         })
     }
 
@@ -346,181 +332,21 @@ impl GpuRenderer {
         });
 
         self.frame_resources = Some(GpuFrameResources {
+            bind_group,
+            output_buffer,
+            output_texture,
+            _output_view: output_view,
             width,
             height,
             padded_bytes_per_row,
-            output_texture,
-            _output_view: output_view,
-            output_buffer,
-            bind_group,
         });
     }
 }
 
-fn compile_scene(scene: &Scene) -> Result<CompiledGpuScene, String> {
-    if scene.objects.is_empty() {
-        return Err("scene must contain at least one object".into());
+impl Drop for GpuRenderer {
+    fn drop(&mut self) {
+        // Explicitly drop per-frame resources first, then drain pending GPU work.
+        self.frame_resources = None;
+        self.device.poll(wgpu::Maintain::Wait);
     }
-    if scene.materials.is_empty() {
-        return Err("scene must contain at least one material".into());
-    }
-    if scene.objects.len() > GPU_MAX_OBJECTS {
-        return Err(format!(
-            "scene has {} objects but GPU backend supports at most {}",
-            scene.objects.len(),
-            GPU_MAX_OBJECTS
-        ));
-    }
-    if scene.materials.len() > MAX_GPU_MATERIALS {
-        return Err(format!(
-            "scene has {} materials but GPU backend supports at most {}",
-            scene.materials.len(),
-            MAX_GPU_MATERIALS
-        ));
-    }
-    if scene.lights.len() > GPU_MAX_LIGHTS {
-        return Err(format!(
-            "scene has {} lights but GPU backend supports at most {}",
-            scene.lights.len(),
-            GPU_MAX_LIGHTS
-        ));
-    }
-
-    let mut object_meta = [[0.0; 4]; GPU_MAX_OBJECTS];
-    let mut object_data0 = [[0.0; 4]; GPU_MAX_OBJECTS];
-    let mut object_data1 = [[0.0; 4]; GPU_MAX_OBJECTS];
-
-    for (index, object) in scene.objects.iter().enumerate() {
-        let material_id = object.material_id.0;
-        let _ = material_by_id(scene, object.name, material_id)?;
-        object_meta[index][1] = material_id as f32;
-
-        match object.kind {
-            ObjectKind::InfinitePlane { y } => {
-                object_meta[index][0] = OBJECT_KIND_PLANE;
-                object_data0[index] = [y, 0.0, 0.0, 0.0];
-            }
-            ObjectKind::Menger {
-                center,
-                scale,
-                iterations,
-            } => {
-                if scale <= 0.0 {
-                    return Err(format!(
-                        "object '{}' has non-positive Menger scale ({scale})",
-                        object.name
-                    ));
-                }
-                if iterations == 0 {
-                    return Err(format!(
-                        "object '{}' has zero Menger iterations",
-                        object.name
-                    ));
-                }
-                object_meta[index][0] = OBJECT_KIND_MENGER;
-                object_data0[index] = [center.x, center.y, center.z, scale];
-                object_data1[index] = [iterations as f32, 0.0, 0.0, 0.0];
-            }
-            ObjectKind::Sphere { center, radius } => {
-                if radius <= 0.0 {
-                    return Err(format!(
-                        "object '{}' has non-positive sphere radius ({radius})",
-                        object.name
-                    ));
-                }
-                object_meta[index][0] = OBJECT_KIND_SPHERE;
-                object_data0[index] = [center.x, center.y, center.z, radius];
-            }
-        }
-    }
-
-    let mut material_albedo_roughness = [[0.0; 4]; MAX_GPU_MATERIALS];
-    let mut material_emission_metallic = [[0.0; 4]; MAX_GPU_MATERIALS];
-    let mut material_optics = [[0.0; 4]; MAX_GPU_MATERIALS];
-    let mut material_absorption = [[0.0; 4]; MAX_GPU_MATERIALS];
-    for (index, material) in scene.materials.iter().enumerate() {
-        material_albedo_roughness[index] = [
-            material.albedo.x,
-            material.albedo.y,
-            material.albedo.z,
-            material.roughness,
-        ];
-        material_emission_metallic[index] = [
-            material.emission.x,
-            material.emission.y,
-            material.emission.z,
-            material.metallic,
-        ];
-        material_optics[index] = [material.ior, material.transmission, 0.0, 0.0];
-        material_absorption[index] = [
-            material.absorption.x,
-            material.absorption.y,
-            material.absorption.z,
-            0.0,
-        ];
-    }
-
-    let mut light_direction = [[0.0; 4]; GPU_MAX_LIGHTS];
-    let mut light_color_intensity = [[0.0; 4]; GPU_MAX_LIGHTS];
-    let mut light_count: usize = 0;
-    for light in &scene.lights {
-        match light.kind {
-            LightKind::Directional {
-                direction,
-                color,
-                intensity,
-            } => {
-                if intensity <= 0.0 {
-                    return Err(format!(
-                        "light '{}' has non-positive intensity ({intensity})",
-                        light.name
-                    ));
-                }
-                if direction.length() < 0.0001 {
-                    return Err(format!(
-                        "light '{}' has near-zero direction vector",
-                        light.name
-                    ));
-                }
-                if light_count >= GPU_MAX_LIGHTS {
-                    return Err(format!(
-                        "scene has more than {} supported lights",
-                        GPU_MAX_LIGHTS
-                    ));
-                }
-                let slot = light_count;
-                let normalized = direction.normalize();
-                light_direction[slot] = [normalized.x, normalized.y, normalized.z, 0.0];
-                light_color_intensity[slot] = [color.x, color.y, color.z, intensity];
-                light_count += 1;
-            }
-        }
-    }
-
-    Ok(CompiledGpuScene {
-        object_count: scene.objects.len() as u32,
-        material_count: scene.materials.len() as u32,
-        light_count: light_count as u32,
-        object_meta,
-        object_data0,
-        object_data1,
-        material_albedo_roughness,
-        material_emission_metallic,
-        material_optics,
-        material_absorption,
-        light_direction,
-        light_color_intensity,
-    })
 }
-
-fn material_by_id<'a>(
-    scene: &'a Scene,
-    object_name: &str,
-    material_id: usize,
-) -> Result<&'a Material, String> {
-    scene.materials.get(material_id).ok_or_else(|| {
-        format!("object '{object_name}' references missing material id {material_id}")
-    })
-}
-
-const GPU_SHADER_WGSL: &str = include_str!("shaders/raytrace.wgsl");

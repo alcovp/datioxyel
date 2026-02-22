@@ -1,10 +1,18 @@
-const MAX_OBJECTS: u32 = 32u;
-const MAX_MATERIALS: u32 = 32u;
-const MAX_LIGHTS: u32 = 8u;
+const MAX_OBJECTS: u32 = __GPU_MAX_OBJECTS__;
+const MAX_MATERIALS: u32 = __GPU_MAX_MATERIALS__;
+const MAX_LIGHTS: u32 = __GPU_MAX_LIGHTS__;
 
 const OBJECT_KIND_PLANE: u32 = 0u;
 const OBJECT_KIND_MENGER: u32 = 1u;
 const OBJECT_KIND_SPHERE: u32 = 2u;
+const OBJECT_KIND_PARALLELEPIPED: u32 = 3u;
+const OBJECT_KIND_CYLINDER: u32 = 4u;
+const OBJECT_KIND_PYRAMID: u32 = 5u;
+const OBJECT_KIND_CAPSULE: u32 = 6u;
+const OBJECT_KIND_FRUSTUM: u32 = 7u;
+const OBJECT_KIND_TORUS: u32 = 8u;
+const OBJECT_KIND_ROUNDED_BOX: u32 = 9u;
+const OBJECT_KIND_ELLIPSOID: u32 = 10u;
 
 struct Params {
     width: u32,
@@ -187,6 +195,57 @@ fn sd_sphere(p: vec3<f32>, radius: f32) -> f32 {
     return length(p) - radius;
 }
 
+fn sd_capped_cylinder_y(p: vec3<f32>, radius: f32, half_height: f32) -> f32 {
+    let q = vec2<f32>(length(p.xz) - radius, abs(p.y) - half_height);
+    let outside = max(q, vec2<f32>(0.0));
+    return length(outside) + min(max(q.x, q.y), 0.0);
+}
+
+fn sd_capsule_y(p: vec3<f32>, radius: f32, half_height: f32) -> f32 {
+    let y_clamped = clamp(p.y, -half_height, half_height);
+    let closest = vec3<f32>(0.0, y_clamped, 0.0);
+    return length(p - closest) - radius;
+}
+
+fn sd_capped_cone_y(
+    p: vec3<f32>,
+    half_height: f32,
+    radius_bottom: f32,
+    radius_top: f32,
+) -> f32 {
+    let y01 = clamp((p.y + half_height) / max(2.0 * half_height, 0.0001), 0.0, 1.0);
+    let radius_at_y = mix(radius_bottom, radius_top, y01);
+    let radial = length(p.xz) - radius_at_y;
+    let caps = abs(p.y) - half_height;
+    let outside = vec2<f32>(max(radial, 0.0), max(caps, 0.0));
+    return length(outside) + min(max(radial, caps), 0.0);
+}
+
+fn sd_torus_y(p: vec3<f32>, major_radius: f32, minor_radius: f32) -> f32 {
+    let q = vec2<f32>(length(p.xz) - major_radius, p.y);
+    return length(q) - minor_radius;
+}
+
+fn sd_rounded_box(p: vec3<f32>, half_extents: vec3<f32>, radius: f32) -> f32 {
+    let inner = max(half_extents - vec3<f32>(radius), vec3<f32>(0.0));
+    let q = abs(p) - inner;
+    let outside = max(q, vec3<f32>(0.0));
+    return length(outside) + min(max(max(q.x, q.y), q.z), 0.0) - radius;
+}
+
+// This is a conservative signed distance estimate for a square pyramid aligned to +Y.
+// It stays safe for sphere tracing (never oversteps), at the cost of slightly shorter steps near edges.
+fn sd_pyramid_y(p: vec3<f32>, half_extent: f32, height: f32) -> f32 {
+    let h = max(height, 0.0001);
+    let half_h = h * 0.5;
+    let side_slope = half_extent / h;
+    let side_norm = sqrt(1.0 + (side_slope * side_slope));
+    let side_x = (abs(p.x) + (side_slope * p.y) - (side_slope * half_h)) / side_norm;
+    let side_z = (abs(p.z) + (side_slope * p.y) - (side_slope * half_h)) / side_norm;
+    let base = -(p.y + half_h);
+    return max(base, max(side_x, side_z));
+}
+
 fn sd_menger(p: vec3<f32>, iterations: u32) -> f32 {
     var distance = sd_box(p, vec3<f32>(1.0));
     var scale = 1.0;
@@ -208,9 +267,17 @@ fn sd_menger(p: vec3<f32>, iterations: u32) -> f32 {
     return distance;
 }
 
-fn object_distance_lower_bound(kind: u32, p: vec3<f32>, data0: vec4<f32>) -> f32 {
+fn object_distance_lower_bound(kind: u32, p: vec3<f32>, data0: vec4<f32>, data1: vec4<f32>) -> f32 {
     if (kind == OBJECT_KIND_PLANE) {
         return p.y - data0.x;
+    }
+    if (kind == OBJECT_KIND_PARALLELEPIPED) {
+        let half_extents = vec3<f32>(
+            max(data0.w, 0.0001),
+            max(data1.x, 0.0001),
+            max(data1.y, 0.0001),
+        );
+        return sd_box(p - data0.xyz, half_extents);
     }
     if (kind == OBJECT_KIND_MENGER) {
         let scale = max(data0.w, 0.0001);
@@ -219,6 +286,47 @@ fn object_distance_lower_bound(kind: u32, p: vec3<f32>, data0: vec4<f32>) -> f32
     }
     if (kind == OBJECT_KIND_SPHERE) {
         return sd_sphere(p - data0.xyz, data0.w);
+    }
+    if (kind == OBJECT_KIND_CYLINDER) {
+        let half_height = max(data1.x, 0.0001);
+        return sd_capped_cylinder_y(p - data0.xyz, max(data0.w, 0.0001), half_height);
+    }
+    if (kind == OBJECT_KIND_CAPSULE) {
+        let half_height = max(data1.x, 0.0001);
+        return sd_capsule_y(p - data0.xyz, max(data0.w, 0.0001), half_height);
+    }
+    if (kind == OBJECT_KIND_FRUSTUM) {
+        let half_height = max(data0.w, 0.0001);
+        let radius_bottom = max(data1.x, 0.0);
+        let radius_top = max(data1.y, 0.0);
+        return sd_capped_cone_y(p - data0.xyz, half_height, radius_bottom, radius_top);
+    }
+    if (kind == OBJECT_KIND_TORUS) {
+        let major_radius = max(data0.w, 0.0001);
+        let minor_radius = max(data1.x, 0.0001);
+        return sd_torus_y(p - data0.xyz, major_radius, minor_radius);
+    }
+    if (kind == OBJECT_KIND_ROUNDED_BOX) {
+        let half_extents = vec3<f32>(
+            max(data0.w, 0.0001),
+            max(data1.x, 0.0001),
+            max(data1.y, 0.0001),
+        );
+        let radius = clamp(data1.z, 0.0, min(min(half_extents.x, half_extents.y), half_extents.z) - 0.0001);
+        return sd_rounded_box(p - data0.xyz, half_extents, max(radius, 0.0));
+    }
+    if (kind == OBJECT_KIND_ELLIPSOID) {
+        let radii = vec3<f32>(
+            max(data0.w, 0.0001),
+            max(data1.x, 0.0001),
+            max(data1.y, 0.0001),
+        );
+        let bound_radius = max(max(radii.x, radii.y), radii.z);
+        return sd_sphere(p - data0.xyz, bound_radius);
+    }
+    if (kind == OBJECT_KIND_PYRAMID) {
+        let height = max(data1.x, 0.0001);
+        return sd_pyramid_y(p - data0.xyz, max(data0.w, 0.0001), height);
     }
     return MAX_TRACE_DISTANCE + 1.0;
 }
@@ -230,7 +338,7 @@ fn object_distance_refined(kind: u32, p: vec3<f32>, data0: vec4<f32>, data1: vec
         let iterations = max(as_u32_rounded(data1.x), 1u);
         return sd_menger(local, iterations) * scale;
     }
-    return object_distance_lower_bound(kind, p, data0);
+    return object_distance_lower_bound(kind, p, data0, data1);
 }
 
 fn sample_scene(p: vec3<f32>) -> SceneSample {
@@ -252,7 +360,7 @@ fn sample_scene(p: vec3<f32>) -> SceneSample {
         let data1 = params.object_data1[i];
 
         // Broad-phase culling: use conservative lower bounds to skip expensive DE eval.
-        let lower_bound = object_distance_lower_bound(kind, p, data0);
+        let lower_bound = object_distance_lower_bound(kind, p, data0, data1);
         if (lower_bound > best.distance) {
             i = i + 1u;
             continue;
